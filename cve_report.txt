@@ -1,0 +1,6 @@
+Vulnerability / CVE Scan Report
+Target: 127.0.0.1
+Scan time (UTC): 2026-07-15T15:09:22.389282+00:00
+Ports scanned: [21, 22, 80, 443]
+Open ports found: 0
+
