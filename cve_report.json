@@ -1,0 +1,12 @@
+{
+  "target": "127.0.0.1",
+  "scan_time_utc": "2026-07-15T15:09:22.389282+00:00",
+  "ports_scanned": [
+    21,
+    22,
+    80,
+    443
+  ],
+  "open_ports": [],
+  "cve_lookup_performed": true
+}
