@@ -1,0 +1,334 @@
+import argparse
+import concurrent.futures
+import ipaddress
+import json
+import logging
+import re
+import socket
+import sys
+import time
+import threading
+from datetime import datetime, timezone
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency. Install with: pip install requests")
+
+
+NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+# Regexes to pull a "product version" guess out of common banners
+BANNER_PATTERNS = [
+    re.compile(r"SSH-\d\.\d-(?P<product>OpenSSH)_(?P<version>[\d.p]+)", re.IGNORECASE),
+    re.compile(r"(?P<product>Apache)[/ ](?P<version>[\d.]+)", re.IGNORECASE),
+    re.compile(r"(?P<product>nginx)[/ ](?P<version>[\d.]+)", re.IGNORECASE),
+    re.compile(r"(?P<product>Microsoft-IIS)[/ ](?P<version>[\d.]+)", re.IGNORECASE),
+    re.compile(r"(?P<product>vsftpd)[ _](?P<version>[\d.]+)", re.IGNORECASE),
+    re.compile(r"(?P<product>ProFTPD)[ _](?P<version>[\d.]+)", re.IGNORECASE),
+    re.compile(r"(?P<product>MySQL)[ /](?P<version>[\d.]+)", re.IGNORECASE),
+    re.compile(r"(?P<product>Postfix)[ /](?P<version>[\d.]+)", re.IGNORECASE),
+]
+
+
+# --------------------------------------------------------------------------- #
+# Safety scope
+# --------------------------------------------------------------------------- #
+
+def is_private_or_local(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        ip = socket.gethostbyname(host)
+        addr = ipaddress.ip_address(ip)
+        return addr.is_private or addr.is_loopback
+    except Exception:
+        return False
+
+
+def enforce_scope(host: str, override: bool):
+    if override:
+        return
+    if not is_private_or_local(host):
+        sys.exit(
+            f"Refusing to scan '{host}': not a localhost/private-network target.\n"
+            "This scanner only tests targets you control by default.\n"
+            "If you have explicit written authorization to test this host, "
+            "re-run with --i-own-this-target."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Banner grabbing
+# --------------------------------------------------------------------------- #
+
+def grab_tcp_banner(host, port, timeout=3):
+    """Generic raw TCP banner grab — works for SSH, FTP, SMTP, etc."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            try:
+                banner = sock.recv(1024)
+                return banner.decode(errors="ignore").strip()
+            except socket.timeout:
+                return None
+    except (ConnectionRefusedError, OSError):
+        return None
+
+
+def grab_http_banner(host, port, timeout=3, use_https=False):
+    """HTTP(S)-specific grab: reads the 'Server' response header."""
+    scheme = "https" if use_https else "http"
+    url = f"{scheme}://{host}:{port}/"
+    try:
+        resp = requests.get(url, timeout=timeout, verify=False)
+        server_header = resp.headers.get("Server")
+        powered_by = resp.headers.get("X-Powered-By")
+        parts = [p for p in [server_header, powered_by] if p]
+        return " | ".join(parts) if parts else None
+    except requests.RequestException:
+        return None
+
+
+def scan_port(host, port, timeout=3):
+    """Try to identify what's running on a port and grab its banner."""
+    result = {"port": port, "open": False, "banner": None, "service_guess": None}
+
+    # Common HTTP(S) ports get the HTTP-specific probe first
+    if port in (80, 8080, 8000, 8888):
+        banner = grab_http_banner(host, port, timeout, use_https=False)
+        if banner:
+            result.update(open=True, banner=banner, service_guess="http")
+            return result
+    if port in (443, 8443):
+        banner = grab_http_banner(host, port, timeout, use_https=True)
+        if banner:
+            result.update(open=True, banner=banner, service_guess="https")
+            return result
+
+    banner = grab_tcp_banner(host, port, timeout)
+    if banner is not None:
+        result.update(open=True, banner=banner)
+    else:
+        # Port might still be open but silent (no banner on connect) —
+        # do a lightweight connect-only check.
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                result["open"] = True
+        except (ConnectionRefusedError, OSError):
+            result["open"] = False
+
+    return result
+
+
+def parse_product_version(banner):
+    if not banner:
+        return None, None
+    for pattern in BANNER_PATTERNS:
+        m = pattern.search(banner)
+        if m:
+            return m.group("product"), m.group("version")
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
+# NVD CVE lookup
+# --------------------------------------------------------------------------- #
+
+class NvdRateLimiter:
+    """NVD public API allows ~5 requests / 30s without an API key."""
+    def __init__(self, min_interval=6.5):
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            wait_for = self._last + self.min_interval - now
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._last = time.monotonic()
+
+
+def query_nvd(product, version, rate_limiter, timeout=15, max_results=5):
+    """Query NVD for CVEs matching 'product version'. Returns a list of
+    dicts with id, severity, score, and a short description."""
+    if not product:
+        return []
+
+    keyword = f"{product} {version}" if version else product
+    params = {"keywordSearch": keyword, "resultsPerPage": max_results}
+
+    rate_limiter.wait()
+    try:
+        resp = requests.get(NVD_API_URL, params=params, timeout=timeout)
+    except requests.RequestException as e:
+        logging.warning(f"NVD lookup failed for '{keyword}': {e}")
+        return []
+
+    if resp.status_code == 429:
+        logging.warning("NVD rate-limited us; waiting and skipping this lookup.")
+        return []
+    if resp.status_code != 200:
+        logging.warning(f"NVD returned status {resp.status_code} for '{keyword}'")
+        return []
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+
+    findings = []
+    for item in data.get("vulnerabilities", []):
+        cve = item.get("cve", {})
+        cve_id = cve.get("id", "UNKNOWN")
+
+        descriptions = cve.get("descriptions", [])
+        desc_text = next((d["value"] for d in descriptions if d.get("lang") == "en"), "")
+        short_desc = (desc_text[:200] + "...") if len(desc_text) > 200 else desc_text
+
+        severity, score = "UNKNOWN", None
+        metrics = cve.get("metrics", {})
+        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            if key in metrics and metrics[key]:
+                cvss_data = metrics[key][0].get("cvssData", {})
+                score = cvss_data.get("baseScore")
+                severity = (
+                    metrics[key][0].get("baseSeverity")
+                    or cvss_data.get("baseSeverity")
+                    or "UNKNOWN"
+                )
+                break
+
+        findings.append({
+            "cve_id": cve_id,
+            "severity": severity,
+            "cvss_score": score,
+            "description": short_desc,
+        })
+
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def parse_ports(port_str):
+    ports = set()
+    for part in port_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-")
+            ports.update(range(int(start), int(end) + 1))
+        elif part:
+            ports.add(int(part))
+    return sorted(ports)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Educational CVE/vulnerability scanner.")
+    parser.add_argument("--host", required=True, help="Target host (IP or hostname)")
+    parser.add_argument("--ports", default="21,22,23,25,80,110,143,443,3306,3389,8080,8443",
+                         help="Comma-separated ports and/or ranges, e.g. '22,80,1000-1010'")
+    parser.add_argument("--timeout", type=float, default=3, help="Per-port timeout (seconds)")
+    parser.add_argument("--threads", type=int, default=10, help="Concurrent port scan threads")
+    parser.add_argument("--no-cve-lookup", action="store_true",
+                         help="Skip NVD CVE lookups (banner-grab only, no internet needed)")
+    parser.add_argument("--output", default="cve_report", help="Output file prefix")
+    parser.add_argument("--i-own-this-target", action="store_true", dest="override",
+                         help="Confirm you're authorized to scan a non-local host")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(f"{args.output}.log"), logging.StreamHandler(sys.stdout)],
+    )
+
+    if not args.no_cve_lookup:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    enforce_scope(args.host, args.override)
+    ports = parse_ports(args.ports)
+    logging.info(f"Target: {args.host} | Ports: {ports}")
+
+    port_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as pool:
+        futures = {pool.submit(scan_port, args.host, p, args.timeout): p for p in ports}
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res["open"]:
+                logging.info(f"[open] port={res['port']} banner={res['banner']!r}")
+            else:
+                logging.debug(f"[closed] port={res['port']}")
+            port_results.append(res)
+
+    port_results.sort(key=lambda r: r["port"])
+
+    rate_limiter = NvdRateLimiter()
+    for res in port_results:
+        if not res["open"] or not res["banner"]:
+            continue
+        product, version = parse_product_version(res["banner"])
+        res["product_guess"] = product
+        res["version_guess"] = version
+
+        if args.no_cve_lookup or not product:
+            res["cve_matches"] = []
+            continue
+
+        logging.info(f"Querying NVD for '{product} {version or ''}'...")
+        res["cve_matches"] = query_nvd(product, version, rate_limiter)
+        for m in res["cve_matches"]:
+            logging.info(f"  -> {m['cve_id']} [{m['severity']}] score={m['cvss_score']}")
+
+    report = {
+        "target": args.host,
+        "scan_time_utc": datetime.now(timezone.utc).isoformat(),
+        "ports_scanned": ports,
+        "open_ports": [r for r in port_results if r["open"]],
+        "cve_lookup_performed": not args.no_cve_lookup,
+    }
+
+    json_path = f"{args.output}.json"
+    with open(json_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    text_path = f"{args.output}.txt"
+    with open(text_path, "w") as f:
+        f.write(f"Vulnerability / CVE Scan Report\n")
+        f.write(f"Target: {args.host}\n")
+        f.write(f"Scan time (UTC): {report['scan_time_utc']}\n")
+        f.write(f"Ports scanned: {ports}\n")
+        f.write(f"Open ports found: {len(report['open_ports'])}\n\n")
+        for r in report["open_ports"]:
+            f.write("-" * 60 + "\n")
+            f.write(f"Port: {r['port']}\n")
+            f.write(f"Banner: {r['banner']}\n")
+            f.write(f"Guessed product/version: {r.get('product_guess')} {r.get('version_guess') or ''}\n")
+            matches = r.get("cve_matches", [])
+            if matches:
+                f.write(f"Possible CVE matches ({len(matches)}):\n")
+                for m in matches:
+                    f.write(f"  - {m['cve_id']} | severity={m['severity']} | "
+                            f"cvss={m['cvss_score']} | {m['description']}\n")
+            else:
+                f.write("Possible CVE matches: none found / not looked up\n")
+            f.write("\n")
+
+    total_cves = sum(len(r.get("cve_matches", [])) for r in report["open_ports"])
+    print("\n" + "=" * 60)
+    print(f"Scan complete. {len(report['open_ports'])} open port(s) found, "
+          f"{total_cves} possible CVE match(es).")
+    print(f"JSON report: {json_path}")
+    print(f"Text report: {text_path}")
+    print(f"Log file:    {args.output}.log")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
